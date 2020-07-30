@@ -4,7 +4,7 @@ import tqdm
 import tensorflow as tf
 import numpy as np
 
-filters = 128
+filters = 32
 kernel_size = 3
 batch_size = 64
 size = 64
@@ -14,67 +14,76 @@ weight_decay = 0.0001
 gpu = tf.config.experimental.list_physical_devices('GPU')[0]
 tf.config.experimental.set_memory_growth(gpu, True)
 
-# TODO: try conv transpose -> dense
-# unless there are orientation specific features this should allow sharing 
-# weights between pixels within a 2x2 block
+mean = tf.keras.Sequential([
+    tf.keras.layers.Conv2D(
+        filters, kernel_size, 1, 'same'
+    ),
+    tf.keras.layers.LeakyReLU(),
+    tf.keras.layers.BatchNormalization(),
+    tf.keras.layers.Dense(3, use_bias=False),
+    tf.keras.layers.Conv2D(
+        filters, kernel_size, 1, 'same'
+    ),
+    tf.keras.layers.LeakyReLU(),
+    tf.keras.layers.BatchNormalization(),
+    tf.keras.layers.Dense(3, use_bias=False),
+    tf.keras.layers.Conv2D(
+        filters, kernel_size, 1, 'same'
+    ),
+    tf.keras.layers.LeakyReLU(),
+    tf.keras.layers.BatchNormalization(),
+    tf.keras.layers.Dense(3)
+])
+
+# factorization of convolutions reduces memory usage but slows down training
+# it increases both the time per step and the number of steps
+
 generator = tf.keras.Sequential([
-    tf.keras.layers.Conv2D(
-        filters, kernel_size, 1, 'same'
-    ),
-    tf.keras.layers.LeakyReLU(),
-    tf.keras.layers.BatchNormalization(),
-    tf.keras.layers.Dense(12, use_bias=False),
-    tf.keras.layers.Conv2D(
-        filters, kernel_size, 1, 'same'
-    ),
-    tf.keras.layers.LeakyReLU(),
-    tf.keras.layers.BatchNormalization(),
-    tf.keras.layers.Dense(12, use_bias=False),
-    tf.keras.layers.Conv2D(
-        filters, kernel_size, 1, 'same'
-    ),
-    tf.keras.layers.LeakyReLU(),
-    tf.keras.layers.BatchNormalization(),
-    tf.keras.layers.Dense(12, use_bias=False),
-    tf.keras.layers.Conv2D(
-        filters, kernel_size, 1, 'same'
-    ),
-    tf.keras.layers.LeakyReLU(),
-    tf.keras.layers.BatchNormalization(),
     tf.keras.layers.Conv2DTranspose(
-        3, 2, 2,
+        filters, kernel_size * 2, 2, 'same'
+    ),
+    tf.keras.layers.LeakyReLU(),
+    tf.keras.layers.BatchNormalization(),
+    tf.keras.layers.Conv2D(
+        filters, kernel_size, 1, 'same'
+    ),
+    tf.keras.layers.LeakyReLU(),
+    tf.keras.layers.BatchNormalization(),
+    tf.keras.layers.Conv2D(
+        filters, kernel_size, 1, 'same'
+    ),
+    tf.keras.layers.LeakyReLU(),
+    tf.keras.layers.BatchNormalization(),
+    tf.keras.layers.Conv2D(
+        filters, kernel_size, 1, 'same'
+    ),
+    tf.keras.layers.LeakyReLU(),
+    tf.keras.layers.BatchNormalization(),
+    tf.keras.layers.Conv2D(
+        3, kernel_size, 1, 'same',
         activation=tf.keras.activations.tanh
     ),
 ])
 
-#encoder = tf.keras.Sequential([
-#    tf.keras.layers.Conv2D(
-#        filters, kernel_size, 1, 'same'
-#    ),
-#    tf.keras.layers.LeakyReLU(),
-#    tf.keras.layers.BatchNormalization(),
-#    tf.keras.layers.Dense(
-#        12
-#    ),
-#])
-
 discriminator = tf.keras.Sequential([
+    #tf.keras.layers.Conv2DTranspose(
+    #    filters, kernel_size * 2, 2, 'same'
+    #),
     tf.keras.layers.Conv2D(
         filters, kernel_size, 1, 'same'
     ),
     tf.keras.layers.LeakyReLU(),
     tf.keras.layers.BatchNormalization(),
-    tf.keras.layers.Dense(12, use_bias=False),
+    tf.keras.layers.Conv2D(
+        filters, kernel_size, 1, 'same'
+    ),
+    tf.keras.layers.LeakyReLU(),
+    tf.keras.layers.BatchNormalization(),
     tf.keras.layers.Conv2D(
         filters, kernel_size, 1, 'same'
     ),
     tf.keras.layers.LeakyReLU(),
     tf.keras.layers.GlobalAveragePooling2D(),
-    tf.keras.layers.BatchNormalization(),
-    tf.keras.layers.Dense(
-        filters
-    ),
-    tf.keras.layers.LeakyReLU(),
     tf.keras.layers.BatchNormalization(),
     tf.keras.layers.Dense(
         1
@@ -129,29 +138,21 @@ def train_step(real):
     small = small * 2 - 1
 
     with tf.GradientTape(persistent=True) as tape:
-        #encoded = encoder(real)
-        #decoded = generator(tf.concat([small, encoded], axis=-1))[..., :3]
-        #decoded = tf.nn.space_to_depth(decoded, 2)
-
-        #fake, median = tf.split(
-        #    generator(tf.concat([small, noise], axis=-1)), 2, -1
-        #)
-        fake = generator(tf.concat([small, noise], axis=-1))
+        #fake = generator(tf.concat([small, noise], axis=-1))
+        fake = generator(small)
 
         real_logits = discriminator(tf.concat([
             tf.nn.space_to_depth(real, 2), 
-            small
+            small,
+            #real
         ], -1))
         fake_logits = discriminator(tf.concat([
             tf.nn.space_to_depth(fake, 2), 
-            small
+            small,
+            #fake
         ], -1))
 
-        encoder_loss = 0#tf.keras.losses.MeanAbsoluteError()(
-        #    decoded, real
-        #)
-
-        mean_loss = tf.keras.losses.MeanSquaredError()(fake, real)
+        median_loss = tf.keras.losses.MeanAbsoluteError()(fake, real)
 
         distribution_loss = tf.keras.losses.BinaryCrossentropy(
             from_logits=True
@@ -159,15 +160,9 @@ def train_step(real):
             tf.ones_like(fake_logits), fake_logits
         )
 
-        median_loss = 0#tf.keras.losses.MeanAbsoluteError()(
-        #    median, real4
-        #)
-
         generator_loss = sum([
-            encoder_loss,
             distribution_loss,
-            median_loss,
-            mean_loss,
+            #median_loss,
         ])
         
         discriminator_loss = sum([
@@ -183,10 +178,6 @@ def train_step(real):
         tape.gradient(generator_loss, generator.trainable_variables), 
         generator.trainable_variables
     ))
-    #optimizer.apply_gradients(zip(
-    #    tape.gradient(generator_loss, encoder.trainable_variables), 
-    #    encoder.trainable_variables
-    #))
     optimizer.apply_gradients(zip(
         tape.gradient(discriminator_loss, discriminator.trainable_variables), 
         discriminator.trainable_variables
@@ -211,7 +202,7 @@ summary_writer = tf.summary.create_file_writer(os.path.join("logs", name))
 example = load_file("example.png")
 example = tf.concat([
     example * 2 - 1,
-    tf.random.normal((example.shape[0], example.shape[1], 12))
+    #tf.random.normal((example.shape[0], example.shape[1], 12))
 ], -1)
 
 for step, image in enumerate(tqdm.tqdm(d)):
