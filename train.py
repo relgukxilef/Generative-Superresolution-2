@@ -6,7 +6,7 @@ import tensorflow_probability as tfp
 import numpy as np
 
 filters = 1024
-kernel_size = 15
+kernel_size = 13
 batch_size = 1
 size = 64
 
@@ -192,7 +192,8 @@ def load_file(file):
     return tf.cast(image, tf.int32)
 
 name = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M")
-summary_writer = tf.summary.create_file_writer(os.path.join("logs", name))
+log_folder = os.path.join("logs", name)
+summary_writer = tf.summary.create_file_writer(log_folder)
 
 example = load_file("example.png")[None]
 
@@ -208,7 +209,14 @@ model.compile(
 
 prediction = model(example)
 
-model.fit(d, steps_per_epoch = 1000)
+model.fit(
+    d, steps_per_epoch = 10000,
+    callbacks=[
+        tf.keras.callbacks.ModelCheckpoint(
+            os.path.join(log_folder, "model.{epoch:02d}.hdf5")
+        )
+    ]
+)
 
 fake = model.sample([4, 64, 64])
 fake = tf.cast(fake, tf.float32) / 255.0
