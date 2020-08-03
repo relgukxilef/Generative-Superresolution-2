@@ -2,60 +2,68 @@
 import datetime, os, glob, math
 import tqdm
 import tensorflow as tf
+import tensorflow_probability as tfp
 import numpy as np
 
 filters = 1024
-kernel_size = 7
+kernel_size = 15
 batch_size = 1
 size = 64
+
+radius = kernel_size // 2
 
 gpu = tf.config.experimental.list_physical_devices('GPU')[0]
 tf.config.experimental.set_memory_growth(gpu, True)
 
-class AutoregressiveConvolution2d(tf.keras.layers.Layer):
+def join_inner_axes(tensor):
+    shape = tf.shape(tensor)
+    return tf.reshape(
+        tensor, tf.concat([shape[:-2], [shape[-2] * shape[-1]]], 0)
+    )
+
+
+class AutoregressiveConvolution2D(tf.keras.layers.Layer):
     # [batch, height, width, features]
     def __init__(self, filters, kernel_size, use_bias=True):
-        super(AutoregressiveConvolution2d, self).__init__()
+        super(AutoregressiveConvolution2D, self).__init__()
 
         self.kernel_size = kernel_size
         self.radius = kernel_size // 2
 
         # Layers can contain other layers
         self.top = tf.keras.layers.Conv2D(
-            filters, (kernel_size, self.radius), 1, 'valid', use_bias=False
+            filters, (self.radius, kernel_size), 1, 'valid', use_bias=False
         )
         self.left = tf.keras.layers.Conv2D(
-            filters, (self.radius, 1), 1, 'valid', use_bias=use_bias
+            filters, (1, self.radius), 1, 'valid', use_bias=use_bias
         )
 
     def call(self, inputs):
         return self.top(
-            tf.pad(inputs[..., :-1, :], [
-                [0, 0], [self.radius, self.radius], [self.radius, 0], [0, 0]
+            tf.pad(inputs[..., :-1, :, :], [
+                [0, 0], [self.radius, 0], [self.radius, self.radius], [0, 0]
             ])
         ) + self.left(
-            tf.pad(inputs[..., :-1, :, :], [
-                [0, 0], [self.radius, 0], [0, 0], [0, 0]
+            tf.pad(inputs[..., :-1, :], [
+                [0, 0], [0, 0], [self.radius, 0], [0, 0]
             ])
         )
 
 class AutoregressiveDense(tf.keras.layers.Layer):
-    # [..., features]
-    def __init__(self, outputs, stride, use_bias=True):
+    # [..., depth, features]
+    def __init__(self, depth, features, use_bias=True):
         super(AutoregressiveDense, self).__init__()
-        self.outputs = outputs
-        self.stride = stride
+        self.features = features
         self.use_bias = use_bias
 
-    def build(self, input_shape):
         self.layers = [
-            tf.keras.layers.Dense(self.outputs, use_bias=self.use_bias) 
-            for _ in range(input_shape[-1] // self.stride)
+            tf.keras.layers.Dense(self.features, use_bias=self.use_bias) 
+            for _ in range(depth)
         ]
 
     def call(self, inputs):
         return tf.stack([
-            layer(inputs[..., :i * self.stride]) 
+            layer(join_inner_axes(inputs[..., :i, :]))
             for i, layer in enumerate(self.layers)
         ], -2)
         # [..., depth, features]
@@ -63,10 +71,10 @@ class AutoregressiveDense(tf.keras.layers.Layer):
 class Scale(tf.keras.Model):
     def __init__(self):
         super(Scale, self).__init__()
-        self.convolution = AutoregressiveConvolution2d(
-            filters * 3, kernel_size, False
+        self.convolution = AutoregressiveConvolution2D(
+            filters, kernel_size, False
         )
-        self.dense = AutoregressiveDense(filters, 256, True)
+        self.dense = AutoregressiveDense(3, filters, True)
         self.final = [tf.keras.layers.Dense(256) for _ in range(3)]
     
     def call(self, inputs):
@@ -74,13 +82,10 @@ class Scale(tf.keras.Model):
         x = tf.one_hot(inputs, 256)
 
         # TODO: gather would be more efficient
-        flattened = tf.reshape(x, tf.concat([tf.shape(x)[:-2], [256 * 3]], 0))
-        spatial = tf.reshape(
-            self.convolution(flattened), 
-            tf.concat([tf.shape(x)[:-2], [3, filters]], 0)
-        )
-        channels = self.dense(flattened)
-        # [batch, height, width, channels, values]
+        flattened = join_inner_axes(x)
+        spatial = self.convolution(flattened)[..., None, :]
+        channels = self.dense(x)
+        # [batch, height, width, channels, features]
 
         x = spatial + channels
         
@@ -89,6 +94,67 @@ class Scale(tf.keras.Model):
             [f(x) for f, x in zip(self.final, tf.unstack(x, axis=-2))], -2
         )
         return x
+
+    def sample(self, size):
+        # size = [..., batches, height, width]
+        # [..., height, width, channels * values]
+        @tf.function
+        def pixel(variables, top_features):
+            left_values, sample = variables
+
+            top_left_features = \
+                top_features[..., None, :] + self.convolution.left(left_values)
+
+            channels = tf.zeros(size[:-2] + [1, 1, 0])
+            samples = []
+
+            for c in range(3):
+                features = top_left_features + self.dense.layers[c](
+                    channels
+                )
+                logits = self.final[c](features)
+                
+                sample = tfp.distributions.Categorical(logits).sample()
+                value = tf.one_hot(sample, 256)
+
+                samples += [sample]
+                channels = tf.concat([channels, value], -1)
+            
+            sample = tf.stack(samples, -1)
+            return (tf.concat([left_values[..., 1:, :], channels], -2), sample)
+        
+        @tf.function
+        def line(variables, context):
+            top_values, sample = variables
+
+            top_features = self.convolution.top(
+                tf.pad(top_values, [[0, 0], [0, 0], [radius, radius], [0, 0]])
+            )
+
+            pixels, sample = tf.scan(
+                pixel, 
+                tf.transpose(top_features, [2, 0, 1, 3]), 
+                (
+                    tf.zeros(size[:-2] + [1, radius, 3 * 256]), 
+                    tf.zeros(size[:-2] + [1, 1, 3], dtype=tf.int32)
+                )
+            )
+
+            pixels = tf.transpose(pixels[..., -1, :], [1, 2, 0, 3])
+            sample = tf.transpose(sample[..., -1, :], [1, 2, 0, 3])
+
+            return (tf.concat([top_values[..., 1:, :, :], pixels], -3), sample)
+
+        sample = tf.transpose(tf.scan(
+            line,
+            tf.zeros((size[-2],)),
+            (
+                tf.zeros(size[:-2] + [radius, size[-1], 3 * 256]), 
+                tf.zeros(size[:-2] + [1, size[-1], 3], dtype=tf.int32)
+            )
+        )[1][..., -1, :, :], [1, 0, 2, 3])
+
+        return sample
 
 paths = glob.glob("../Datasets/Derpibooru/cropped/*.png")
 
@@ -116,7 +182,7 @@ lanczos3_1d = tf.constant(
 
 d = tf.data.Dataset.from_tensor_slices(tf.constant(paths))
 d = d.map(load_example, num_parallel_calls = 16).cache()
-d = d.shuffle(100).repeat()
+d = d.shuffle(10000).repeat()
 d = d.batch(batch_size).prefetch(100)
 
 
@@ -130,6 +196,9 @@ summary_writer = tf.summary.create_file_writer(os.path.join("logs", name))
 example = load_file("example.png")[None]
 
 model = Scale()
+
+#fake = model.sample([4, 64, 64])
+
 model.compile(
     tf.keras.optimizers.Adam(), 
     tf.keras.losses.SparseCategoricalCrossentropy(True),
@@ -138,4 +207,12 @@ model.compile(
 
 prediction = model(example)
 
-model.fit(d, steps_per_epoch = 1000)
+model.fit(d, steps_per_epoch = 2000)
+
+fake = model.sample([4, 64, 64])
+fake = tf.cast(fake, tf.float32) / 255.0
+
+with summary_writer.as_default():
+    tf.summary.image(
+        'fake', fake, 0, 4
+    )
