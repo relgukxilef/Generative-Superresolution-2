@@ -81,7 +81,7 @@ class Scale(tf.keras.Model):
         # inputs is int32 [batch, height, width, channels]
         x = tf.one_hot(inputs, 256)
 
-        # TODO: gather would be more efficient
+        # TODO: gather might be more efficient
         flattened = join_inner_axes(x)
         spatial = self.convolution(flattened)[..., None, :]
         channels = self.dense(x)
@@ -112,6 +112,7 @@ class Scale(tf.keras.Model):
                 features = top_left_features + self.dense.layers[c](
                     channels
                 )
+                features = tf.nn.relu(features)
                 logits = self.final[c](features)
                 
                 sample = tfp.distributions.Categorical(logits).sample()
@@ -207,7 +208,7 @@ model.compile(
 
 prediction = model(example)
 
-model.fit(d, steps_per_epoch = 2000)
+model.fit(d, steps_per_epoch = 1000)
 
 fake = model.sample([4, 64, 64])
 fake = tf.cast(fake, tf.float32) / 255.0
