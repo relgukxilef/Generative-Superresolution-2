@@ -9,6 +9,10 @@ filters = 1024
 kernel_size = 13
 batch_size = 1
 size = 64
+steps_per_epoch = 1000
+epochs = 100
+dataset = "../Datasets/Derpibooru/cropped/*.png"
+example_file = "example.png"
 
 radius = kernel_size // 2
 
@@ -157,7 +161,7 @@ class Scale(tf.keras.Model):
 
         return sample
 
-paths = glob.glob("../Datasets/Derpibooru/cropped/*.png")
+paths = glob.glob(dataset)
 
 @tf.function
 def load_example(file):
@@ -193,13 +197,12 @@ def load_file(file):
 
 name = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M")
 log_folder = os.path.join("logs", name)
+os.makedirs(log_folder)
 summary_writer = tf.summary.create_file_writer(log_folder)
 
-example = load_file("example.png")[None]
+example = load_file(example_file)[None]
 
 model = Scale()
-
-#fake = model.sample([4, 64, 64])
 
 model.compile(
     tf.keras.optimizers.Adam(), 
@@ -209,19 +212,26 @@ model.compile(
 
 prediction = model(example)
 
+def log_sample(epochs, logs):
+    fake = model.sample([4, size, size])
+    fake = tf.cast(fake, tf.float32) / 255.0
+
+    with summary_writer.as_default():
+        tf.summary.image(
+            'fake', fake, epochs, 4
+        )
+
 model.fit(
-    d, steps_per_epoch = 10000,
+    d, steps_per_epoch=steps_per_epoch, epochs=epochs,
     callbacks=[
         tf.keras.callbacks.ModelCheckpoint(
             os.path.join(log_folder, "model.{epoch:02d}.hdf5")
+        ),
+        tf.keras.callbacks.TensorBoard(
+            log_dir=log_folder, write_graph=True, write_images=True
+        ),
+        tf.keras.callbacks.LambdaCallback(
+            on_epoch_end=log_sample
         )
     ]
 )
-
-fake = model.sample([4, 64, 64])
-fake = tf.cast(fake, tf.float32) / 255.0
-
-with summary_writer.as_default():
-    tf.summary.image(
-        'fake', fake, 0, 4
-    )
