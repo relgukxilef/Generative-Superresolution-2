@@ -220,6 +220,7 @@ def log_sample(epochs, logs):
         tf.summary.image(
             'fake', fake, epochs, 4
         )
+    del fake
 
 model.fit(
     d, steps_per_epoch=steps_per_epoch, epochs=epochs,
@@ -228,7 +229,8 @@ model.fit(
             os.path.join(log_folder, "model.{epoch:02d}.hdf5")
         ),
         tf.keras.callbacks.TensorBoard(
-            log_dir=log_folder, write_graph=True, write_images=True
+            log_dir=log_folder, write_graph=True, write_images=False, 
+            profile_batch=0
         ),
         tf.keras.callbacks.LambdaCallback(
             on_epoch_end=log_sample
