@@ -7,12 +7,14 @@ import numpy as np
 
 filters = 1024
 kernel_size = 13
-batch_size = 1
+batch_size = 2
 size = 64
 steps_per_epoch = 1000
 epochs = 100
+color_size = 8
 dataset = "../Datasets/Derpibooru/cropped/*.png"
 example_file = "example.png"
+checkpoint_file = None
 
 radius = kernel_size // 2
 
@@ -24,6 +26,12 @@ def join_inner_axes(tensor):
     return tf.reshape(
         tensor, tf.concat([shape[:-2], [shape[-2] * shape[-1]]], 0)
     )
+
+def gelu(x):
+    return 0.5*x*(1+tf.tanh(np.sqrt(2/np.pi)*(x+0.044715*tf.pow(x, 3))))
+
+def activation(x):
+    return tf.nn.relu(x)
 
 
 class AutoregressiveConvolution2D(tf.keras.layers.Layer):
@@ -79,11 +87,11 @@ class Scale(tf.keras.Model):
             filters, kernel_size, False
         )
         self.dense = AutoregressiveDense(3, filters, True)
-        self.final = [tf.keras.layers.Dense(256) for _ in range(3)]
+        self.final = [tf.keras.layers.Dense(color_size) for _ in range(3)]
     
     def call(self, inputs):
         # inputs is int32 [batch, height, width, channels]
-        x = tf.one_hot(inputs, 256)
+        x = tf.one_hot(inputs, color_size)
 
         # TODO: gather might be more efficient
         flattened = join_inner_axes(x)
@@ -93,13 +101,13 @@ class Scale(tf.keras.Model):
 
         x = spatial + channels
         
-        x = tf.nn.relu(x)
+        x = activation(x)
         x = tf.stack(
             [f(x) for f, x in zip(self.final, tf.unstack(x, axis=-2))], -2
         )
         return x
 
-    def sample(self, size):
+    def sample(self, size, initial_state=None):
         # size = [..., batches, height, width]
         # [..., height, width, channels * values]
         @tf.function
@@ -116,11 +124,11 @@ class Scale(tf.keras.Model):
                 features = top_left_features + self.dense.layers[c](
                     channels
                 )
-                features = tf.nn.relu(features)
+                features = activation(features)
                 logits = self.final[c](features)
                 
                 sample = tfp.distributions.Categorical(logits).sample()
-                value = tf.one_hot(sample, 256)
+                value = tf.one_hot(sample, color_size)
 
                 samples += [sample]
                 channels = tf.concat([channels, value], -1)
@@ -140,7 +148,7 @@ class Scale(tf.keras.Model):
                 pixel, 
                 tf.transpose(top_features, [2, 0, 1, 3]), 
                 (
-                    tf.zeros(size[:-2] + [1, radius, 3 * 256]), 
+                    tf.zeros(size[:-2] + [1, radius, 3 * color_size]), 
                     tf.zeros(size[:-2] + [1, 1, 3], dtype=tf.int32)
                 )
             )
@@ -150,11 +158,20 @@ class Scale(tf.keras.Model):
 
             return (tf.concat([top_values[..., 1:, :, :], pixels], -3), sample)
 
+        if initial_state is None:
+            initial_state = tf.zeros(
+                size[:-2] + [radius, size[-1], 3 * color_size]
+            )
+        else:
+            initial_state = join_inner_axes(
+                tf.one_hot(initial_state[..., -radius:, :size[-1], :], color_size)
+            )
+
         sample = tf.transpose(tf.scan(
             line,
             tf.zeros((size[-2],)),
             (
-                tf.zeros(size[:-2] + [radius, size[-1], 3 * 256]), 
+                initial_state, 
                 tf.zeros(size[:-2] + [1, size[-1], 3], dtype=tf.int32)
             )
         )[1][..., -1, :, :], [1, 0, 2, 3])
@@ -167,7 +184,7 @@ paths = glob.glob(dataset)
 def load_example(file):
     image = tf.image.decode_png(tf.io.read_file(file))[:, :, :3]
     image = tf.image.random_crop(image, [size + 10, size + 10, 3])
-    image = tf.cast(image, tf.int32)
+    image = tf.cast(image, tf.int32) * color_size // 256
     return (image, image)
 
 lanczos3 = [
@@ -193,34 +210,48 @@ d = d.batch(batch_size).prefetch(100)
 
 def load_file(file):
     image = tf.image.decode_png(tf.io.read_file(file))[:size, :size, :3]
-    return tf.cast(image, tf.int32)
+    return tf.cast(image, tf.int32) * color_size // 256
 
-name = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M")
+name = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 log_folder = os.path.join("logs", name)
 os.makedirs(log_folder)
 summary_writer = tf.summary.create_file_writer(log_folder)
 
-example = load_file(example_file)[None]
+example = load_file(example_file)[None, :size // 2, :, :]
 
 model = Scale()
-
-model.compile(
-    tf.keras.optimizers.Adam(), 
-    tf.keras.losses.SparseCategoricalCrossentropy(True),
-    [tf.keras.metrics.SparseCategoricalAccuracy()]
-)
 
 prediction = model(example)
 
 def log_sample(epochs, logs):
+    fake = model.sample([1, size // 2, size], example)
+    fake = tf.concat([example, fake], 1)
+    fake = tf.cast(fake, tf.float32) / (color_size - 1)
+
+    with summary_writer.as_default():
+        tf.summary.image(
+            'completion', fake, epochs, 4
+        )
+    del fake
+
     fake = model.sample([4, size, size])
-    fake = tf.cast(fake, tf.float32) / 255.0
+    fake = tf.cast(fake, tf.float32) / (color_size - 1)
 
     with summary_writer.as_default():
         tf.summary.image(
             'fake', fake, epochs, 4
         )
     del fake
+
+if checkpoint_file is not None:
+    model.load_weights(checkpoint_file)
+    log_sample(0, [])
+
+model.compile(
+    tf.keras.optimizers.Adam(), 
+    tf.keras.losses.SparseCategoricalCrossentropy(True),
+    [tf.keras.metrics.SparseCategoricalAccuracy()]
+)
 
 model.fit(
     d, steps_per_epoch=steps_per_epoch, epochs=epochs,
