@@ -179,6 +179,7 @@ class Scale(tf.keras.Model):
         return sample
 
 paths = glob.glob(dataset)
+random.shuffle(paths)
 
 @tf.function
 def load_example(file):
@@ -204,7 +205,7 @@ lanczos3_1d = tf.constant(
 
 d = tf.data.Dataset.from_tensor_slices(tf.constant(paths))
 d = d.map(load_example, num_parallel_calls = 16).cache()
-d = d.shuffle(10000).repeat()
+d = d.repeat()
 d = d.batch(batch_size).prefetch(100)
 
 
