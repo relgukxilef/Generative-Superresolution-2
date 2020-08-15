@@ -1,17 +1,18 @@
 
-import datetime, os, glob, math
+import datetime, os, glob, math, random
 import tqdm
 import tensorflow as tf
 import tensorflow_probability as tfp
 import numpy as np
 
 filters = 1024
-kernel_size = 13
-batch_size = 2
+kernel_size = 9
+input_kernel = 15
+batch_size = 1
 size = 64
 steps_per_epoch = 1000
 epochs = 100
-color_size = 8
+color_size = 64
 dataset = "../Datasets/Derpibooru/cropped/*.png"
 example_file = "example.png"
 checkpoint_file = None
@@ -32,6 +33,39 @@ def gelu(x):
 
 def activation(x):
     return tf.nn.relu(x)
+
+def discrete_to_continuous(x):
+    return tf.cast(x, tf.float32) / color_size
+
+def continuous_to_discrete(x):
+    return tf.clip_by_value(
+        tf.cast(x * color_size, tf.int32), 0, color_size - 1
+    )
+
+lanczos3 = [
+    3 * math.sin(math.pi * x) * math.sin(math.pi * x / 3) / math.pi**2 / x**2
+    for x in np.linspace(-2.75, 2.75, 12)
+]
+lanczos3 = [x / sum(lanczos3) for x in lanczos3]
+lanczos3_1d = tf.constant(
+    [
+        [[
+            [a if o == i else 0 for o in range(3)]
+            for i in range(3)
+        ]] 
+        for a in lanczos3
+    ], dtype=tf.float32
+)
+
+def scale_down(x):
+    # gamma corrected Lanczos3 scaling
+    return tf.maximum(tf.nn.conv2d(
+        tf.nn.conv2d(
+            discrete_to_continuous(example)**2.2, 
+            lanczos3_1d, [1, 2, 1, 1], 'VALID'
+        ), 
+        tf.transpose(lanczos3_1d, [1, 0, 2, 3]), [1, 1, 2, 1], 'VALID'
+    ), 0.0) ** (1/2.2)
 
 
 class AutoregressiveConvolution2D(tf.keras.layers.Layer):
@@ -83,15 +117,28 @@ class AutoregressiveDense(tf.keras.layers.Layer):
 class Scale(tf.keras.Model):
     def __init__(self):
         super(Scale, self).__init__()
+        self.input_convolution = tf.keras.layers.Conv2DTranspose(
+            filters, input_kernel, 2, 'same'
+        )
         self.convolution = AutoregressiveConvolution2D(
             filters, kernel_size, False
         )
         self.dense = AutoregressiveDense(3, filters, True)
         self.final = [tf.keras.layers.Dense(color_size) for _ in range(3)]
     
-    def call(self, inputs):
+    def call(self, example):
         # inputs is int32 [batch, height, width, channels]
-        x = tf.one_hot(inputs, color_size)
+
+        small = continuous_to_discrete(
+            scale_down(discrete_to_continuous(example))
+        )
+
+        example = example[..., 5:-5, 5:-5, :]
+        
+        x = tf.one_hot(example, color_size)
+        small = join_inner_axes(tf.one_hot(small, color_size))
+
+        context = self.input_convolution(small)[..., None, :]
 
         # TODO: gather might be more efficient
         flattened = join_inner_axes(x)
@@ -99,7 +146,9 @@ class Scale(tf.keras.Model):
         channels = self.dense(x)
         # [batch, height, width, channels, features]
 
-        x = spatial + channels
+        x = spatial
+        x += channels
+        x += context
         
         x = activation(x)
         x = tf.stack(
@@ -107,7 +156,7 @@ class Scale(tf.keras.Model):
         )
         return x
 
-    def sample(self, size, initial_state=None):
+    def sample(self, size, small):
         # size = [..., batches, height, width]
         # [..., height, width, channels * values]
         @tf.function
@@ -142,7 +191,7 @@ class Scale(tf.keras.Model):
 
             top_features = self.convolution.top(
                 tf.pad(top_values, [[0, 0], [0, 0], [radius, radius], [0, 0]])
-            )
+            ) + context
 
             pixels, sample = tf.scan(
                 pixel, 
@@ -158,18 +207,17 @@ class Scale(tf.keras.Model):
 
             return (tf.concat([top_values[..., 1:, :, :], pixels], -3), sample)
 
-        if initial_state is None:
-            initial_state = tf.zeros(
-                size[:-2] + [radius, size[-1], 3 * color_size]
-            )
-        else:
-            initial_state = join_inner_axes(
-                tf.one_hot(initial_state[..., -radius:, :size[-1], :], color_size)
-            )
+        context = self.input_convolution(
+            join_inner_axes(tf.one_hot(small, color_size))
+        )
+
+        initial_state = tf.zeros(
+            size[:-2] + [radius, size[-1], 3 * color_size]
+        )
 
         sample = tf.transpose(tf.scan(
             line,
-            tf.zeros((size[-2],)),
+            tf.transpose(context, [1, 0, 2, 3]),
             (
                 initial_state, 
                 tf.zeros(size[:-2] + [1, size[-1], 3], dtype=tf.int32)
@@ -186,7 +234,7 @@ def load_example(file):
     image = tf.image.decode_png(tf.io.read_file(file))[:, :, :3]
     image = tf.image.random_crop(image, [size + 10, size + 10, 3])
     image = tf.cast(image, tf.int32) * color_size // 256
-    return (image, image)
+    return (image, image[..., 5:-5, 5:-5, :])
 
 lanczos3 = [
     3 * math.sin(math.pi * x) * math.sin(math.pi * x / 3) / math.pi**2 / x**2
@@ -209,33 +257,19 @@ d = d.repeat()
 d = d.batch(batch_size).prefetch(100)
 
 
-def load_file(file):
-    image = tf.image.decode_png(tf.io.read_file(file))[:size, :size, :3]
-    return tf.cast(image, tf.int32) * color_size // 256
-
 name = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 log_folder = os.path.join("logs", name)
 os.makedirs(log_folder)
 summary_writer = tf.summary.create_file_writer(log_folder)
 
-example = load_file(example_file)[None, :size // 2, :, :]
+example = load_example(example_file)[0][None]
 
 model = Scale()
 
 prediction = model(example)
 
 def log_sample(epochs, logs):
-    fake = model.sample([1, size // 2, size], example)
-    fake = tf.concat([example, fake], 1)
-    fake = tf.cast(fake, tf.float32) / (color_size - 1)
-
-    with summary_writer.as_default():
-        tf.summary.image(
-            'completion', fake, epochs, 4
-        )
-    del fake
-
-    fake = model.sample([4, size, size])
+    fake = model.sample([4, size * 2 + 20, size * 2 + 20], example)
     fake = tf.cast(fake, tf.float32) / (color_size - 1)
 
     with summary_writer.as_default():
