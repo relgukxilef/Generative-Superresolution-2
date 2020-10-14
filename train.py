@@ -10,7 +10,7 @@ kernel_size = 3
 block_size = 4
 batch_size = 64
 size = 64
-steps_per_epoch = 100
+steps_per_epoch = 500
 epochs = 100
 dataset = "../Datasets/Derpibooru/cropped/*.png"
 example_file = "example2.png"
@@ -66,7 +66,7 @@ class Scale(tf.keras.Model):
         ) for _ in range(block_size * block_size * 3)]
 
         self.denses = [
-            tf.keras.layers.Dense(1)
+            tf.keras.layers.Dense(2)
             for _ in range(block_size * block_size * 3)
         ]
     
@@ -79,18 +79,22 @@ class Scale(tf.keras.Model):
 
         context = tf.concat([small, example], -1)
 
-        prediction = []
+        mean = []
+        variance = []
         for i in range(block_size * block_size * 3):
             x = context[..., :tf.shape(small)[-1] + i]
             x = self.convolutions[i](x)
             x = self.denses[i](x)
-            prediction += [x]
-            
-        prediction = tf.concat(prediction, -1)
+            mean += [x[..., 0]]
+            variance += [x[..., 1]]
+        
+        mean = tf.stack(mean, -1)
+        variance = tf.stack(variance, -1)
+        
+        mean = tf.nn.depth_to_space(mean, block_size) * 0.5 + 0.5
+        variance = tf.exp(tf.nn.depth_to_space(variance, block_size)) * 0.5
 
-        prediction = tf.nn.depth_to_space(prediction, block_size)
-
-        return prediction * 0.5 + 0.5
+        return tf.stack([mean, variance], -1)
 
     def sample(self, small):
         small = small * 2 - 1
@@ -101,7 +105,10 @@ class Scale(tf.keras.Model):
             x = prediction
             x = self.convolutions[i](x)
             x = self.denses[i](x)
-            prediction = tf.concat([prediction, x], -1)
+            x = tfp.distributions.TruncatedNormal(
+                x[..., 0], tf.exp(x[..., 1]), -1.0, 1.0
+            ).sample()
+            prediction = tf.concat([prediction, x[..., None]], -1)
         
         prediction = prediction[..., tf.shape(small)[-1]:]
 
@@ -154,13 +161,18 @@ example = prepare_example(load_example(example_file))
 
 model = Scale()
 
-prediction = model(example[0][None])
-
-loss = tf.keras.losses.MeanSquaredError()(prediction, example[1][None])
+def negative_log_probability(sample, prediction):   
+    distribution = tfp.distributions.Normal(
+        prediction[..., 0], prediction[..., 1]
+    )
+    return -tf.reduce_mean(distribution.log_prob(sample))
 
 def log_sample(epochs, logs):
     fake = model.sample(example[0][None])
     prediction = model(example[0][None])
+    prediction = tfp.distributions.Normal(
+        prediction[..., 0], prediction[..., 1]
+    ).sample()
 
     with summary_writer.as_default():
         tf.summary.image(
@@ -171,14 +183,18 @@ def log_sample(epochs, logs):
         )
     del fake, prediction
 
+prediction = model(example[0][None])
+
+loss = negative_log_probability(example[1][None], prediction)
+
 if checkpoint_file is not None:
     model.load_weights(checkpoint_file)
     log_sample(0, [])
 
 model.compile(
     tf.keras.optimizers.Adam(1e-4), 
-    tf.keras.losses.MeanSquaredError(),
-    [tf.keras.metrics.RootMeanSquaredError()]
+    negative_log_probability,
+    []
 )
 
 model.fit(
